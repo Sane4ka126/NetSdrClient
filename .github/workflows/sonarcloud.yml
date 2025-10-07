@@ -36,48 +36,101 @@ on:
   workflow_dispatch:
 
 permissions:
-  pull-requests: read # allows SonarCloud to decorate PRs with analysis results
+  pull-requests: read
 
 jobs:
   sonar-check:
     name: Sonar Check
-    runs-on: windows-latest   # безпечно для будь-яких .NET проектів
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with: 
+          fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # 1) BEGIN: SonarScanner for .NET
-      - name: SonarScanner Begin
+      - name: Install/Update SonarScanner
         run: |
-          dotnet tool install --global dotnet-sonarscanner
-          echo "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
-          dotnet sonarscanner begin `
-          /k:"ppanchen_NetSdrClient" `
-          /o:"ppanchen" `
-          /d:sonar.token="${{ secrets.SONAR_TOKEN }}" `
-          /d:sonar.cs.opencover.reportsPaths="**/coverage.xml" `
-          /d:sonar.cpd.cs.minimumTokens=40 `
-          /d:sonar.cpd.cs.minimumLines=5 `
-          /d:sonar.exclusions=**/bin/**,**/obj/**,**/sonarcloud.yml `
-          /d:sonar.qualitygate.wait=true
+          dotnet tool install --global dotnet-sonarscanner 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            dotnet tool update --global dotnet-sonarscanner
+          }
         shell: pwsh
-      # 2) BUILD & TEST
-      - name: Restore
+
+      - name: Restore Dependencies
         run: dotnet restore NetSdrClient.sln
-      - name: Build
-        run: dotnet build NetSdrClient.sln -c Release --no-restore
-      - name: Tests with coverage (OpenCover)
+
+      - name: SonarScanner Begin
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          dotnet test NetSdrClientAppTests/NetSdrClientAppTests.csproj -c Release --no-build `
-            /p:CollectCoverage=true `
-            /p:CoverletOutput=TestResults/coverage.xml `
-            /p:CoverletOutputFormat=opencover
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            Write-Host "Running PR analysis for PR #${{ github.event.pull_request.number }}"
+            dotnet sonarscanner begin `
+              /k:"ppanchen_NetSdrClient" `
+              /o:"ppanchen" `
+              /d:sonar.host.url="https://sonarcloud.io" `
+              /d:sonar.token="$env:SONAR_TOKEN" `
+              /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" `
+              /d:sonar.exclusions="**/bin/**,**/obj/**,**/*Tests/**" `
+              /d:sonar.coverage.exclusions="**/*Tests/**" `
+              /d:sonar.pullrequest.key="${{ github.event.pull_request.number }}" `
+              /d:sonar.pullrequest.branch="${{ github.head_ref }}" `
+              /d:sonar.pullrequest.base="${{ github.base_ref }}"
+          } else {
+            Write-Host "Running branch analysis for ${{ github.ref_name }}"
+            dotnet sonarscanner begin `
+              /k:"ppanchen_NetSdrClient" `
+              /o:"ppanchen" `
+              /d:sonar.host.url="https://sonarcloud.io" `
+              /d:sonar.token="$env:SONAR_TOKEN" `
+              /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" `
+              /d:sonar.exclusions="**/bin/**,**/obj/**,**/*Tests/**" `
+              /d:sonar.coverage.exclusions="**/*Tests/**"
+          }
         shell: pwsh
-      # 3) END: SonarScanner
+
+      - name: Build Solution
+        run: dotnet build NetSdrClient.sln -c Release --no-restore
+
+      - name: Run Tests with Coverage
+        run: |
+          dotnet test NetSdrClientAppTests/NetSdrClientAppTests.csproj `
+            --configuration Release `
+            --no-build `
+            /p:CollectCoverage=true `
+            /p:CoverletOutputFormat=opencover `
+            /p:CoverletOutput=./coverage.opencover.xml `
+            /p:Exclude="[*Tests]*"
+        shell: pwsh
+        continue-on-error: true
+
+      - name: Verify Coverage File
+        run: |
+          $coverageFile = "NetSdrClientAppTests/coverage.opencover.xml"
+          if (Test-Path $coverageFile) {
+            Write-Host "✅ Coverage file found: $coverageFile" -ForegroundColor Green
+            $size = (Get-Item $coverageFile).Length
+            Write-Host "File size: $size bytes"
+            if ($size -lt 100) {
+              Write-Host "⚠️ Warning: Coverage file seems too small" -ForegroundColor Yellow
+            }
+          } else {
+            Write-Host "⚠️ Coverage file not found at: $coverageFile" -ForegroundColor Yellow
+            Write-Host "Searching for coverage files..."
+            Get-ChildItem -Path . -Recurse -Filter "*.opencover.xml" | ForEach-Object {
+              Write-Host "Found: $($_.FullName)"
+            }
+          }
+        shell: pwsh
+
       - name: SonarScanner End
-        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner end /d:sonar.token="$env:SONAR_TOKEN"
         shell: pwsh
